@@ -125,6 +125,130 @@ if body.get('database_connectivity') != 'CONNECTED':
             }
         }
 
+        // ============ NEW: Security Scan stage — Ryan ============
+        // Design choice: this pulls the CURRENTLY PUSHED Docker Hub images
+        // (not the freshly-built test images from Integration Testing above),
+        // so the exact same scan logic works whether this stage runs after a
+        // normal push OR on Alden's nightly timer trigger — no special-casing
+        // needed for "what image do I scan tonight vs. right now".
+        // Runs on EVERY trigger (push AND nightly) — this is the one stage
+        // that intentionally has no TimerTrigger guard.
+        //
+        // Two scanners, two layers (defense in depth):
+        //   - Trivy scans the built IMAGES: the base image's OS packages plus
+        //     every library actually installed inside the container.
+        //   - OWASP Dependency-Check scans the SOURCE manifests those images
+        //     are built from (backend/requirements.txt,
+        //     frontend/package-lock.json) against the NVD CVE database.
+        // Install/config steps for both tools (locally + on this Jenkins
+        // server): see SECURITY_SCANNING.md at the repo root.
+        stage('Security Scan') {
+            environment {
+                // ---- Enforcement knobs (the ONLY lines to touch later) ----
+                // Phase 1 (current): REPORT-ONLY, so day-one builds don't
+                // hard-fail on pre-existing vulnerabilities nobody has
+                // triaged yet. After the baseline cleanup
+                // (SECURITY_SCANNING.md sections 6-7), flip to Phase 2:
+                //   TRIVY_EXIT_CODE  '0'  -> '1'  (fail on HIGH/CRITICAL)
+                //   DC_FAIL_CVSS     '11' -> '7'  (fail on CVSS >= 7.0;
+                //                                  11 can never trigger — max is 10)
+                TRIVY_EXIT_CODE = '0'
+                TRIVY_SEVERITY  = 'HIGH,CRITICAL'
+                DC_FAIL_CVSS    = '11'
+            }
+            steps {
+                echo '🛡️ Scanning current images for vulnerabilities (Trivy + OWASP DC)...'
+                sh '''
+                    # Preflight: fail fast with a fixable message instead of a
+                    # cryptic one ten minutes into a scan.
+                    if [ -z "${DOCKER_USER:-}" ]; then
+                        echo "ERROR: DOCKER_USER is not set on this Jenkins."
+                        echo "Set it under Manage Jenkins -> System -> Global properties"
+                        echo "-> Environment variables (SECURITY_SCANNING.md, section 5)."
+                        exit 1
+                    fi
+                    command -v trivy >/dev/null 2>&1 || {
+                        echo "ERROR: trivy is not installed on this Jenkins agent (SECURITY_SCANNING.md, section 5)."; exit 1; }
+                    command -v dependency-check.sh >/dev/null 2>&1 || {
+                        echo "ERROR: dependency-check.sh is not installed on this Jenkins agent (SECURITY_SCANNING.md, section 5)."; exit 1; }
+
+                    # Pull the images CURRENTLY on Docker Hub (see design note
+                    # above: identical logic for push and nightly runs).
+                    docker pull ${DOCKER_USER}/foodgorilla-backend:latest
+                    docker pull ${DOCKER_USER}/foodgorilla-frontend:latest
+
+                    # Vulnerability DBs live on the jenkins_home volume so they
+                    # survive container rebuilds — they can't live in the
+                    # workspace because Checkout wipes it with deleteDir()
+                    # every single build.
+                    export TRIVY_CACHE_DIR="${JENKINS_HOME}/trivy-cache"
+
+                    # Trivy image scans. Scan BOTH images before deciding
+                    # pass/fail, so a failing backend scan never hides the
+                    # frontend's findings (and vice versa).
+                    SCAN_STATUS=0
+                    trivy image \
+                        --scanners vuln \
+                        --severity ${TRIVY_SEVERITY} \
+                        --exit-code ${TRIVY_EXIT_CODE} \
+                        --no-progress \
+                        --output trivy-backend.txt \
+                        ${DOCKER_USER}/foodgorilla-backend:latest || SCAN_STATUS=1
+                    trivy image \
+                        --scanners vuln \
+                        --severity ${TRIVY_SEVERITY} \
+                        --exit-code ${TRIVY_EXIT_CODE} \
+                        --no-progress \
+                        --output trivy-frontend.txt \
+                        ${DOCKER_USER}/foodgorilla-frontend:latest || SCAN_STATUS=1
+
+                    echo "===== Trivy findings: backend image ====="
+                    cat trivy-backend.txt || true
+                    echo "===== Trivy findings: frontend image ====="
+                    cat trivy-frontend.txt || true
+
+                    # OWASP Dependency-Check over the source dependency
+                    # manifests. --enableExperimental is required for the
+                    # Python (requirements.txt) analyzers. NVD_API_KEY is
+                    # optional but strongly recommended (SECURITY_SCANNING.md,
+                    # section 4) — set +x so the key never lands in build logs.
+                    set +x
+                    NVD_KEY_ARG=""
+                    if [ -n "${NVD_API_KEY:-}" ]; then
+                        NVD_KEY_ARG="--nvdApiKey ${NVD_API_KEY}"
+                        echo "Using NVD API key from Jenkins global configuration."
+                    else
+                        echo "WARNING: NVD_API_KEY is not set — NVD database updates will be slow/rate-limited (SECURITY_SCANNING.md, section 4)."
+                    fi
+                    dependency-check.sh \
+                        --project "${APP_NAME}" \
+                        --scan backend \
+                        --scan frontend \
+                        --exclude "**/node_modules/**" \
+                        --enableExperimental \
+                        --format HTML --format JSON \
+                        --out dependency-check-report \
+                        --data "${JENKINS_HOME}/dependency-check-data" \
+                        --failOnCVSS ${DC_FAIL_CVSS} \
+                        ${NVD_KEY_ARG} || SCAN_STATUS=1
+                    set -x
+
+                    # Non-zero only when a scanner found enforceable issues or
+                    # genuinely errored — in report-only phase this stays 0
+                    # unless a scan itself broke (which SHOULD fail the build).
+                    exit ${SCAN_STATUS}
+                '''
+            }
+            post {
+                always {
+                    // Reports for every run, pass or fail: build page ->
+                    // "Archived artifacts" (trivy-*.txt + HTML/JSON DC report).
+                    archiveArtifacts artifacts: 'trivy-*.txt, dependency-check-report/**', allowEmptyArchive: true
+                }
+            }
+        }
+        // ============ END NEW ============
+
         // STAGE 2.5: AUTO-OPEN PR TO MAIN (feature branches only, after tests pass)
         stage('Open Pull Request to main') {
             when {
