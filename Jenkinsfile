@@ -126,13 +126,26 @@ if body.get('database_connectivity') != 'CONNECTED':
         }
 
         // ============ NEW: Security Scan stage — Ryan ============
-        // Design choice: this pulls the CURRENTLY PUSHED Docker Hub images
-        // (not the freshly-built test images from Integration Testing above),
-        // so the exact same scan logic works whether this stage runs after a
-        // normal push OR on Alden's nightly timer trigger — no special-casing
-        // needed for "what image do I scan tonight vs. right now".
+        // Design choice: this scans the images the PREVIOUS stage just built,
+        // not images pulled from a registry. This repo has no Docker Hub push
+        // stage (and docker-compose.yml declares no "image:" keys), so there is
+        // nothing published to pull — a registry-based scan could never go
+        // green here. Integration Testing runs immediately above this on every
+        // branch and every trigger, and its teardown is "down -v
+        // --remove-orphans" WITHOUT --rmi, so the images it built are still
+        // present on the Docker host when this stage runs.
+        //
+        // Compose names build-only images "<project>-<service>", and the test
+        // project is "${APP_NAME}_test", so the two targets are
+        // foodgorilla_test-backend:latest and foodgorilla_test-frontend:latest.
+        //
+        // Trade-off, stated plainly: we lose "re-scan the artifact that is
+        // actually published" and gain "scan exactly what this commit builds."
         // Runs on EVERY trigger (push AND nightly) — this is the one stage
-        // that intentionally has no TimerTrigger guard.
+        // that intentionally has no TimerTrigger guard. The nightly run works
+        // the same way: Integration Testing rebuilds both images from the
+        // latest commit first, so the nightly scan re-scans a fresh build
+        // against a freshly updated CVE database.
         //
         // Two scanners, two layers (defense in depth):
         //   - Trivy scans the built IMAGES: the base image's OS packages plus
@@ -157,25 +170,28 @@ if body.get('database_connectivity') != 'CONNECTED':
                 DC_FAIL_CVSS    = '11'
             }
             steps {
-                echo '🛡️ Scanning current images for vulnerabilities (Trivy + OWASP DC)...'
+                echo '🛡️ Scanning freshly built images for vulnerabilities (Trivy + OWASP DC)...'
                 sh '''
                     # Preflight: fail fast with a fixable message instead of a
                     # cryptic one ten minutes into a scan.
-                    if [ -z "${DOCKER_USER:-}" ]; then
-                        echo "ERROR: DOCKER_USER is not set on this Jenkins."
-                        echo "Set it under Manage Jenkins -> System -> Global properties"
-                        echo "-> Environment variables (SECURITY_SCANNING.md, section 5)."
-                        exit 1
-                    fi
                     command -v trivy >/dev/null 2>&1 || {
                         echo "ERROR: trivy is not installed on this Jenkins agent (SECURITY_SCANNING.md, section 5)."; exit 1; }
                     command -v dependency-check.sh >/dev/null 2>&1 || {
                         echo "ERROR: dependency-check.sh is not installed on this Jenkins agent (SECURITY_SCANNING.md, section 5)."; exit 1; }
 
-                    # Pull the images CURRENTLY on Docker Hub (see design note
-                    # above: identical logic for push and nightly runs).
-                    docker pull ${DOCKER_USER}/foodgorilla-backend:latest
-                    docker pull ${DOCKER_USER}/foodgorilla-frontend:latest
+                    # The two scan targets are built by Integration Testing
+                    # immediately above. If they are missing, that stage did not
+                    # build them under the expected name — say so here rather
+                    # than letting Trivy fail with a bare "image not found".
+                    BACKEND_IMAGE="${APP_NAME}_test-backend:latest"
+                    FRONTEND_IMAGE="${APP_NAME}_test-frontend:latest"
+                    for IMG in "${BACKEND_IMAGE}" "${FRONTEND_IMAGE}"; do
+                        docker image inspect "${IMG}" >/dev/null 2>&1 || {
+                            echo "ERROR: expected image ${IMG} is not present on this Docker host."
+                            echo "It is built by the Integration Testing stage. Check that stage's"
+                            echo "log, and see SECURITY_SCANNING.md section 9 (troubleshooting)."
+                            exit 1; }
+                    done
 
                     # Vulnerability DBs live on the jenkins_home volume so they
                     # survive container rebuilds — they can't live in the
@@ -193,14 +209,14 @@ if body.get('database_connectivity') != 'CONNECTED':
                         --exit-code ${TRIVY_EXIT_CODE} \
                         --no-progress \
                         --output trivy-backend.txt \
-                        ${DOCKER_USER}/foodgorilla-backend:latest || SCAN_STATUS=1
+                        "${BACKEND_IMAGE}" || SCAN_STATUS=1
                     trivy image \
                         --scanners vuln \
                         --severity ${TRIVY_SEVERITY} \
                         --exit-code ${TRIVY_EXIT_CODE} \
                         --no-progress \
                         --output trivy-frontend.txt \
-                        ${DOCKER_USER}/foodgorilla-frontend:latest || SCAN_STATUS=1
+                        "${FRONTEND_IMAGE}" || SCAN_STATUS=1
 
                     echo "===== Trivy findings: backend image ====="
                     cat trivy-backend.txt || true

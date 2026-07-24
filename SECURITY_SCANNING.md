@@ -25,15 +25,32 @@ release, so the pipeline does it:
 
 | Tool | What it scans | What it catches |
 |---|---|---|
-| **Trivy** | The Docker images **currently pushed to Docker Hub** (`$DOCKER_USER/foodgorilla-backend:latest`, `$DOCKER_USER/foodgorilla-frontend:latest`) | Vulnerable OS packages in the base image + vulnerable libraries actually installed inside the container |
+| **Trivy** | The Docker images the **`Integration Testing` stage just built** (`foodgorilla_test-backend:latest`, `foodgorilla_test-frontend:latest`) | Vulnerable OS packages in the base image + vulnerable libraries actually installed inside the container |
 | **OWASP Dependency-Check (DC)** | The **source dependency manifests** in the repo (`backend/requirements.txt`, `frontend/package-lock.json`) | Third-party libraries with published CVEs, straight from the NVD database |
 
-**Why scan the pushed Docker Hub images instead of the freshly built test
-images?** So the *identical* scan logic works for both trigger types — a
-normal push and Alden's nightly re-scan — with no special-casing of
-"which image do I scan tonight vs. right now." The nightly run matters
-because a CVE can be published *tomorrow* for an image we pushed *today*;
-re-scanning the same pushed image catches that without any code change.
+**Why scan the locally built images rather than pulling from a registry?**
+Because this project has no registry to pull from. There is no Docker Hub
+push stage in the `Jenkinsfile`, and `docker-compose.yml` declares no
+`image:` keys — every service is build-only, so Compose names the images
+locally and nothing is ever published. A registry-based scan could never
+go green here.
+
+Scanning the local build works because `Integration Testing` runs
+immediately before this stage on **every** branch and **every** trigger,
+and its teardown is `down -v --remove-orphans` **without `--rmi`** — so
+the images it built are still on the Docker host when the scan runs.
+Compose names build-only images `<project>-<service>`, and the test
+project is `foodgorilla_test`, which is where those two image names come
+from.
+
+**The trade-off, stated plainly:** we give up "re-scan the artifact that
+is actually published" and get "scan exactly what this commit builds."
+The nightly run still does its job — a CVE published *tomorrow* against a
+base image we built *today* is caught, because Integration Testing
+rebuilds both images from the latest commit before the nightly scan runs,
+and the scan checks them against a freshly updated CVE database. If the
+team later adds a real Docker Hub push stage, revisit this: scanning the
+published artifact as well would be a genuine improvement.
 
 **Two-phase rollout (important):**
 
@@ -156,22 +173,27 @@ the host. The compose file runs the container as root, so installs are
 straightforward.
 
 > ⚠️ **Do this BEFORE merging the `Security Scan` stage to main.** The
-> stage preflight-checks for both tools and for `DOCKER_USER`, and fails
-> with a pointer to this section if anything's missing. That failure is
-> intentional and actionable — but let's just not hit it.
+> stage preflight-checks for both tools and fails with a pointer to this
+> section if either is missing. That failure is intentional and
+> actionable — but let's just not hit it.
 
 ### 5.1 Set the pipeline environment variables
+
+There is **only one** variable to set, and it's optional-but-recommended.
+No Docker Hub credentials are needed: the stage scans images built
+locally by the previous stage, so it never logs in or pulls from a
+registry.
 
 In Jenkins UI: **Manage Jenkins → System → Global properties → Environment
 variables → Add**:
 
 | Name | Value | Required? |
 |---|---|---|
-| `DOCKER_USER` | Our team Docker Hub username — the namespace the pipeline pushes `foodgorilla-backend` / `foodgorilla-frontend` to | **Yes** — the stage fails fast without it |
 | `NVD_API_KEY` | An NVD API key (fine to use the setup person's — or request a dedicated one for the team) | Recommended — without it DC's NVD updates are painfully slow |
 
-The stage reads both from the environment; the API key is deliberately
-kept out of build logs (`set +x` around that command).
+The stage reads this from the environment, and the key is deliberately
+kept out of build logs (`set +x` around that command). If it's unset the
+stage prints a warning and carries on — slow, not broken.
 
 ### 5.2 Install Trivy in the Jenkins container
 
@@ -259,28 +281,44 @@ whoever pushed that morning gets blamed for two years of base-image debt.
 Everyone (or at least a couple of us, with results shared) runs this
 before we schedule the Phase 2 flip.
 
-### 6.1 Trivy against the current Docker Hub images — report-only
+### 6.1 Trivy against the locally built images — report-only
 
-Report-only is simply **omitting `--exit-code 1`** (Trivy's default exit
-code is 0 — findings are printed, exit status stays clean):
+First build the same two images the pipeline scans. `build` only builds —
+it starts no containers, so there is nothing to tear down afterwards:
 
 ```bash
-# Use the same DOCKER_USER value as in Jenkins (our Docker Hub username):
-export DOCKER_USER="<team-dockerhub-username>"
+# From the repo root. Copy .env.example to .env first if you haven't
+# (Compose reads POSTGRES_PASSWORD from it):
+cp -n .env.example .env
 
-docker pull $DOCKER_USER/foodgorilla-backend:latest
-docker pull $DOCKER_USER/foodgorilla-frontend:latest
+# -f docker-compose.yml on its own skips docker-compose.override.yml,
+# exactly like the pipeline does. Services are named explicitly.
+docker compose -f docker-compose.yml -p foodgorilla_test build backend frontend
 
-# REPORT-ONLY: no --exit-code flag anywhere.
-trivy image --scanners vuln --severity HIGH,CRITICAL --no-progress \
-  $DOCKER_USER/foodgorilla-backend:latest | tee trivy-backend-baseline.txt
-trivy image --scanners vuln --severity HIGH,CRITICAL --no-progress \
-  $DOCKER_USER/foodgorilla-frontend:latest | tee trivy-frontend-baseline.txt
+# Confirm the two image names the scan expects now exist:
+docker images | grep foodgorilla_test
 ```
 
-This mirrors the pipeline exactly (`--scanners vuln`, `HIGH,CRITICAL`),
-just without failing on findings. Save the two baseline files somewhere
-shared (e.g. the team drive) — that's our before picture.
+> ⚠️ Never run a bare `docker compose down` or `up` in this repo — `down`
+> cannot be scoped to individual services and tears down the whole named
+> project, and `jenkins` is a service in this same compose file. The
+> `build` command above avoids the problem entirely by never starting
+> anything.
+
+Now scan. Report-only is simply **omitting `--exit-code 1`** (Trivy's
+default exit code is 0 — findings are printed, exit status stays clean):
+
+```bash
+# REPORT-ONLY: no --exit-code flag anywhere.
+trivy image --scanners vuln --severity HIGH,CRITICAL --no-progress \
+  foodgorilla_test-backend:latest | tee trivy-backend-baseline.txt
+trivy image --scanners vuln --severity HIGH,CRITICAL --no-progress \
+  foodgorilla_test-frontend:latest | tee trivy-frontend-baseline.txt
+```
+
+This mirrors the pipeline exactly (same images, `--scanners vuln`,
+`HIGH,CRITICAL`), just without failing on findings. Save the two baseline
+files somewhere shared (e.g. the team drive) — that's our before picture.
 
 ### 6.2 Dependency-Check against the repo — report-only
 
@@ -389,10 +427,10 @@ anything.
 
 | Symptom | Cause / fix |
 |---|---|
-| Stage fails immediately: `DOCKER_USER is not set` | Do section 5.1 (Jenkins global env var) |
 | Stage fails immediately: `trivy is not installed` / `dependency-check.sh is not installed` | Do sections 5.2–5.3; if the Jenkins container was recently rebuilt, this is expected — see 5.5 |
 | First DC run takes forever / NVD `403` or `404` errors | Missing/typo'd NVD API key — section 4 (local) or 5.1 (Jenkins). Also just retry: NVD itself has flaky days |
-| `docker pull` fails in the stage | The `$DOCKER_USER/foodgorilla-backend:latest` / `-frontend:latest` images must exist on Docker Hub — check the push stage ran, and the `DOCKER_USER` value matches the namespace it pushes to. (Docker Hub anonymous pull rate limits can also bite; a `docker login` on the Jenkins host clears that) |
+| Stage fails: `expected image foodgorilla_test-backend:latest is not present` | The scan targets are built by `Integration Testing` right above, so check that stage's log first. If it passed, the likely cause is an image-naming change: Compose names build-only images `<project>-<service>`, so renaming the compose project or a service renames the images too. Run `docker images \| grep foodgorilla_test` on the Jenkins host to see the real names, and update the two names in the stage to match |
+| Trivy reports `0 vulnerabilities` on both images and it looks too good | Check the DB actually updated — an air-gapped or rate-limited Trivy will happily scan against a stale/empty database. `trivy image --download-db-only` on the Jenkins host, then re-run |
 | DC reports nothing for the backend | `--enableExperimental` missing — Python analyzers are experimental in DC and off by default (the pipeline command includes it; include it locally too) |
 | Everything is slow / Jenkins container gets killed | This box is memory-tight with no swap. Don't run local heavy builds or the section 5.4 pre-warm while a pipeline build is in flight |
 | Your push's build fails in `Integration Testing` before ever reaching the scan, with weird container-name conflicts | Known collision: two branches' test stages fight over the same `foodgorilla_test` compose project. Don't push at the same time as a teammate testing their branch — re-run when theirs finishes |
@@ -403,8 +441,12 @@ anything.
 ## Quick reference card
 
 ```bash
+# Build the two images the pipeline scans (starts nothing):
+docker compose -f docker-compose.yml -p foodgorilla_test build backend frontend
+
 # Local report-only image scan (mirrors the pipeline):
-trivy image --scanners vuln --severity HIGH,CRITICAL <image>
+trivy image --scanners vuln --severity HIGH,CRITICAL foodgorilla_test-backend:latest
+trivy image --scanners vuln --severity HIGH,CRITICAL foodgorilla_test-frontend:latest
 
 # Local report-only dependency scan (from repo root):
 dependency-check.sh --project foodgorilla --scan backend --scan frontend \
